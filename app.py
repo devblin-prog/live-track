@@ -10,7 +10,15 @@ from flask_cors import CORS
 import requests
 
 app = Flask(__name__)
-CORS(app, origins=["https://grandgaz.wuaze.com", "http://localhost"])
+
+ALLOWED_ORIGINS = [
+    "https://grand-gaz.elementfx.com",   # domaine actuel
+    "https://grandgaz.wuaze.com",         # ancien domaine (garde pour sécurité)
+    "http://localhost",
+    "http://localhost:8000",
+]
+
+CORS(app, origins=ALLOWED_ORIGINS)
 
 F1_NEGOTIATE = "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1"
 
@@ -24,12 +32,12 @@ HEADERS = {
 def negotiate():
     try:
         r = requests.post(F1_NEGOTIATE, headers=HEADERS, timeout=8)
-        
+
         # Récupérer le cookie AWSALBCORS si présent
         aws_cookie = r.cookies.get("AWSALBCORS") or r.cookies.get("AWSALB") or ""
-        
+
         data = r.json()
-        
+
         return jsonify({
             "connectionToken": data.get("connectionToken") or data.get("connectionId") or "",
             "connectionId":    data.get("connectionId") or "",
