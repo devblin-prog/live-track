@@ -1,31 +1,31 @@
 """
 Grand Gaz — Backend F1 Live Timing
-Rôle : negotiate SignalR F1 + bridge WebSocket complet (cookie AWSALBCORS transparent).
-Deploy sur Render (free tier).
+HTTP + WebSocket bridge sur le même port (Render free = 1 seul port).
+- GET  /negotiate  → token + cookie AWS
+- WS   /ws?id=TOKEN&cookie=AWS  → bridge bidirectionnel vers F1
 """
 
 import asyncio
-import threading
+import os
 import requests
 import websockets
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from websockets.sync.client import connect as ws_connect
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
+from quart import Quart, jsonify, websocket
+from quart_cors import cors
 
-app = Flask(__name__)
-
-ALLOWED_ORIGINS = [
+app = Quart(__name__)
+app = cors(app, allow_origin=[
     "https://grand-gaz.elementfx.com",
     "https://grandgaz.wuaze.com",
     "http://localhost",
     "http://localhost:8000",
-]
-CORS(app, origins=ALLOWED_ORIGINS)
+])
 
 F1_NEGOTIATE = "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1"
 F1_HUB       = "wss://livetiming.formula1.com/signalrcore"
 
-HEADERS = {
+REQ_HEADERS = {
     "User-Agent":      "BestHTTP",
     "Accept-Encoding": "gzip, identity",
     "Connection":      "keep-alive",
@@ -34,9 +34,13 @@ HEADERS = {
 # ── Negotiate ────────────────────────────────────────────────────────────────
 
 @app.route("/negotiate")
-def negotiate():
+async def negotiate():
     try:
-        r = requests.post(F1_NEGOTIATE, headers=HEADERS, timeout=8)
+        loop = asyncio.get_event_loop()
+        r = await loop.run_in_executor(
+            None,
+            lambda: requests.post(F1_NEGOTIATE, headers=REQ_HEADERS, timeout=8)
+        )
         aws_cookie = r.cookies.get("AWSALBCORS") or r.cookies.get("AWSALB") or ""
         data = r.json()
         token = data.get("connectionToken") or data.get("connectionId") or ""
@@ -50,67 +54,45 @@ def negotiate():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ── WebSocket bridge ──────────────────────────────────────────────────────────
-# Le navigateur se connecte en WS à /ws?id=TOKEN
-# Le proxy ouvre un WS vers F1 avec le cookie AWS et relaie tout.
+# ── WebSocket bridge (/ws) ────────────────────────────────────────────────────
 
-async def bridge(ws_browser, token: str, aws_cookie: str):
-    """Relaie bidirectionnellement entre le navigateur et F1."""
+@app.websocket("/ws")
+async def ws_bridge():
+    token      = websocket.args.get("id", "")
+    aws_cookie = websocket.args.get("cookie", "")
+
     f1_url = F1_HUB + "?id=" + token
-    f1_headers = dict(HEADERS)
+    ws_headers = dict(REQ_HEADERS)
     if aws_cookie:
-        f1_headers["Cookie"] = f"AWSALBCORS={aws_cookie}"
+        ws_headers["Cookie"] = f"AWSALBCORS={aws_cookie}"
 
     try:
-        async with websockets.connect(f1_url, additional_headers=f1_headers) as ws_f1:
+        async with websockets.connect(f1_url, additional_headers=ws_headers) as f1_ws:
+
             async def browser_to_f1():
-                async for msg in ws_browser:
-                    await ws_f1.send(msg)
+                while True:
+                    data = await websocket.receive()
+                    await f1_ws.send(data)
 
             async def f1_to_browser():
-                async for msg in ws_f1:
-                    await ws_browser.send(msg)
+                async for msg in f1_ws:
+                    await websocket.send(msg)
 
             await asyncio.gather(browser_to_f1(), f1_to_browser())
+
     except Exception as e:
-        print(f"[bridge] Erreur: {e}")
-
-async def ws_handler(websocket):
-    path = websocket.request.path          # ex: /ws?id=TOKEN
-    params = {}
-    if "?" in path:
-        for kv in path.split("?", 1)[1].split("&"):
-            if "=" in kv:
-                k, v = kv.split("=", 1)
-                params[k] = v
-
-    token      = params.get("id", "")
-    aws_cookie = params.get("cookie", "")
-
-    # Vérifier l'origine
-    origin = websocket.request.headers.get("Origin", "")
-    if origin and origin not in ALLOWED_ORIGINS:
-        await websocket.close(1008, "Origin not allowed")
-        return
-
-    await bridge(websocket, token, aws_cookie)
-
-def run_ws_server():
-    """Lance le serveur WS dans son propre thread/event loop."""
-    async def _serve():
-        async with websockets.serve(ws_handler, "0.0.0.0", 10001):
-            await asyncio.Future()   # tourne indéfiniment
-    asyncio.run(_serve())
-
-# Démarrer le bridge WS en thread daemon au lancement Flask
-_ws_thread = threading.Thread(target=run_ws_server, daemon=True)
-_ws_thread.start()
+        print(f"[bridge] Erreur WS: {e}")
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.route("/health")
-def health():
+async def health():
     return jsonify({"status": "ok"})
 
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    config = Config()
+    config.bind = [f"0.0.0.0:{port}"]
+    asyncio.run(serve(app, config))
