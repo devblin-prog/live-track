@@ -1,29 +1,31 @@
 """
 Grand Gaz — Backend F1 Live Timing
-HTTP + WebSocket bridge sur le même port (Render free = 1 seul port).
-- GET  /negotiate  → token + cookie AWS
-- WS   /ws?id=TOKEN&cookie=AWS  → bridge bidirectionnel vers F1
+Flask + gevent-websocket sur port unique.
+- GET /negotiate  → token + cookie AWS
+- WS  /ws         → bridge bidirectionnel vers F1
+- GET /health     → ok
 """
 
-import asyncio
 import os
 import requests
-import websockets
-from hypercorn.asyncio import serve
-from hypercorn.config import Config
-from quart import Quart, jsonify, websocket
-from quart_cors import cors
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from geventwebsocket import WebSocketApplication, Resource, WebSocketServer
+from geventwebsocket.websocket import WebSocket
+import gevent
 
-app = Quart(__name__)
-app = cors(app, allow_origin=[
+app = Flask(__name__)
+
+ALLOWED_ORIGINS = [
     "https://grand-gaz.elementfx.com",
     "https://grandgaz.wuaze.com",
     "http://localhost",
     "http://localhost:8000",
-])
+]
+CORS(app, origins=ALLOWED_ORIGINS)
 
 F1_NEGOTIATE = "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1"
-F1_HUB       = "wss://livetiming.formula1.com/signalrcore"
+F1_HUB_WS    = "wss://livetiming.formula1.com/signalrcore"
 
 REQ_HEADERS = {
     "User-Agent":      "BestHTTP",
@@ -31,16 +33,12 @@ REQ_HEADERS = {
     "Connection":      "keep-alive",
 }
 
-# ── Negotiate ────────────────────────────────────────────────────────────────
+# ── HTTP routes ───────────────────────────────────────────────────────────────
 
 @app.route("/negotiate")
-async def negotiate():
+def negotiate():
     try:
-        loop = asyncio.get_event_loop()
-        r = await loop.run_in_executor(
-            None,
-            lambda: requests.post(F1_NEGOTIATE, headers=REQ_HEADERS, timeout=8)
-        )
+        r = requests.post(F1_NEGOTIATE, headers=REQ_HEADERS, timeout=8)
         aws_cookie = r.cookies.get("AWSALBCORS") or r.cookies.get("AWSALB") or ""
         data = r.json()
         token = data.get("connectionToken") or data.get("connectionId") or ""
@@ -48,51 +46,76 @@ async def negotiate():
             "connectionToken": token,
             "connectionId":    data.get("connectionId") or "",
             "awsCookie":       aws_cookie,
-            "url":             data.get("url") or F1_HUB,
+            "url":             data.get("url") or F1_HUB_WS,
             "ok":              True
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ── WebSocket bridge (/ws) ────────────────────────────────────────────────────
-
-@app.websocket("/ws")
-async def ws_bridge():
-    token      = websocket.args.get("id", "")
-    aws_cookie = websocket.args.get("cookie", "")
-
-    f1_url = F1_HUB + "?id=" + token
-    ws_headers = dict(REQ_HEADERS)
-    if aws_cookie:
-        ws_headers["Cookie"] = f"AWSALBCORS={aws_cookie}"
-
-    try:
-        async with websockets.connect(f1_url, additional_headers=ws_headers) as f1_ws:
-
-            async def browser_to_f1():
-                while True:
-                    data = await websocket.receive()
-                    await f1_ws.send(data)
-
-            async def f1_to_browser():
-                async for msg in f1_ws:
-                    await websocket.send(msg)
-
-            await asyncio.gather(browser_to_f1(), f1_to_browser())
-
-    except Exception as e:
-        print(f"[bridge] Erreur WS: {e}")
-
-# ── Health ────────────────────────────────────────────────────────────────────
-
 @app.route("/health")
-async def health():
+def health():
     return jsonify({"status": "ok"})
+
+# ── WebSocket bridge ──────────────────────────────────────────────────────────
+
+class F1BridgeApp(WebSocketApplication):
+    def on_open(self):
+        ws    = self.ws
+        token = request.args.get("id", "")
+        cookie= request.args.get("cookie", "")
+
+        origin = request.headers.get("Origin", "")
+        if origin and origin not in ALLOWED_ORIGINS:
+            ws.close()
+            return
+
+        f1_url = F1_HUB_WS + "?id=" + token
+        hdrs   = dict(REQ_HEADERS)
+        if cookie:
+            hdrs["Cookie"] = f"AWSALBCORS={cookie}"
+
+        import websocket as ws_lib   # websocket-client (sync, gevent-friendly)
+        self.f1_ws = ws_lib.create_connection(f1_url, header=hdrs)
+        f1 = self.f1_ws
+
+        def relay_f1_to_browser():
+            try:
+                while True:
+                    msg = f1.recv()
+                    if msg is None:
+                        break
+                    ws.send(msg)
+            except Exception:
+                pass
+            finally:
+                ws.close()
+
+        gevent.spawn(relay_f1_to_browser)
+
+    def on_message(self, msg):
+        if msg and hasattr(self, 'f1_ws'):
+            try:
+                self.f1_ws.send(msg)
+            except Exception:
+                pass
+
+    def on_close(self, reason):
+        if hasattr(self, 'f1_ws'):
+            try:
+                self.f1_ws.close()
+            except Exception:
+                pass
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    config = Config()
-    config.bind = [f"0.0.0.0:{port}"]
-    asyncio.run(serve(app, config))
+    server = WebSocketServer(
+        ("0.0.0.0", port),
+        Resource([
+            ("^/ws",   F1BridgeApp),
+            ("^/.*",   app),
+        ])
+    )
+    print(f"[GrandGaz] Proxy démarré sur port {port}")
+    server.serve_forever()
