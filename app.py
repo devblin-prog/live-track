@@ -6,9 +6,9 @@ asyncio pur, zéro dépendance C — compatible Python 3.14
 - GET /health     → ok
 """
 
-import os, json, asyncio
+import os, json, time, sys
 import urllib.request, urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 
 F1_NEGOTIATE = "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1"
@@ -28,21 +28,30 @@ REQ_HEADERS = {
     "Connection":      "keep-alive",
 }
 
-def do_negotiate():
-    req = urllib.request.Request(F1_NEGOTIATE, method="POST", headers=REQ_HEADERS)
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        body    = resp.read()
-        raw_cookie = resp.getheader("Set-Cookie") or ""
-        data    = json.loads(body)
-        token   = data.get("connectionToken") or data.get("connectionId") or ""
-        # Extraire AWSALBCORS du header Set-Cookie
-        aws = ""
-        for part in raw_cookie.split(";"):
-            part = part.strip()
-            if part.startswith("AWSALBCORS=") or part.startswith("AWSALB="):
-                aws = part.split("=", 1)[1]
-                break
-        return token, aws, data
+def do_negotiate(max_attempts=3):
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = urllib.request.Request(F1_NEGOTIATE, method="POST", headers=REQ_HEADERS)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body    = resp.read()
+                raw_cookie = resp.getheader("Set-Cookie") or ""
+                data    = json.loads(body)
+                token   = data.get("connectionToken") or data.get("connectionId") or ""
+                # Extraire AWSALBCORS du header Set-Cookie
+                aws = ""
+                for part in raw_cookie.split(";"):
+                    part = part.strip()
+                    if part.startswith("AWSALBCORS=") or part.startswith("AWSALB="):
+                        aws = part.split("=", 1)[1]
+                        break
+                return token, aws, data
+        except Exception as e:
+            last_err = e
+            print(f"[negotiate] tentative {attempt}/{max_attempts} échouée: {e}", file=sys.stderr)
+            if attempt < max_attempts:
+                time.sleep(0.8 * attempt)
+    raise last_err
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -103,6 +112,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _ws_bridge(self):
+        try:
+            self._ws_bridge_inner()
+        except Exception as e:
+            print(f"[ws_bridge] erreur: {e}", file=sys.stderr)
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+
+    def _ws_bridge_inner(self):
         import base64, hashlib, ssl, socket as sock_mod, threading
 
         # Lire les query params
@@ -194,8 +213,11 @@ class Handler(BaseHTTPRequestHandler):
         t1.start(); t2.start()
         t1.join(); t2.join()
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"[GrandGaz] Proxy démarré sur port {port}")
+    server = Server(("0.0.0.0", port), Handler)
+    print(f"[GrandGaz] Proxy démarré sur port {port} (threaded)")
     server.serve_forever()
