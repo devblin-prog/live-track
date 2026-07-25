@@ -192,9 +192,25 @@ class Handler(BaseHTTPRequestHandler):
         while b"\r\n\r\n" not in buf:
             buf += f1_sock.recv(1)
         if b"101" not in buf:
+            print(f"[ws_bridge] F1 a refusé le handshake: {buf[:200]!r}", file=sys.stderr)
             browser_sock.close()
             f1_sock.close()
             return
+
+        print("[ws_bridge] handshake F1 OK, pont ouvert", file=sys.stderr)
+
+        # Le navigateur envoie souvent sa 1ère frame WS juste après la requête d'upgrade,
+        # dans le même paquet TCP. self.rfile (bufferisé) a pu déjà l'aspirer dans son
+        # tampon interne pendant la lecture des headers HTTP : il faut la récupérer avant
+        # de basculer sur le socket brut, sinon elle est perdue et F1 attend indéfiniment.
+        try:
+            leftover = self.rfile.peek(65536) if hasattr(self.rfile, "peek") else b""
+        except Exception:
+            leftover = b""
+        if leftover:
+            leftover = self.rfile.read(len(leftover))
+            if leftover:
+                f1_sock.sendall(leftover)
 
         # Bridge raw TCP bidirectionnel
         def relay(src, dst):
