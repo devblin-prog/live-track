@@ -35,16 +35,17 @@ def do_negotiate(max_attempts=3):
             req = urllib.request.Request(F1_NEGOTIATE, method="POST", headers=REQ_HEADERS)
             with urllib.request.urlopen(req, timeout=8) as resp:
                 body    = resp.read()
-                raw_cookie = resp.getheader("Set-Cookie") or ""
                 data    = json.loads(body)
                 token   = data.get("connectionToken") or data.get("connectionId") or ""
-                # Extraire AWSALBCORS du header Set-Cookie
-                aws = ""
-                for part in raw_cookie.split(";"):
-                    part = part.strip()
-                    if part.startswith("AWSALBCORS=") or part.startswith("AWSALB="):
-                        aws = part.split("=", 1)[1]
-                        break
+                # Récupérer TOUS les Set-Cookie (AWSALB et AWSALBCORS) et les renvoyer
+                # tels quels sous forme "NOM=valeur; NOM2=valeur2" pour le Cookie du handshake WS.
+                # (l'ancienne version prenait la valeur d'AWSALB et l'envoyait sous le nom AWSALBCORS)
+                pairs = []
+                for sc in resp.headers.get_all("Set-Cookie") or []:
+                    first = sc.split(";", 1)[0].strip()
+                    if first.startswith("AWSALB"):
+                        pairs.append(first)
+                aws = "; ".join(pairs)
                 return token, aws, data
         except Exception as e:
             last_err = e
@@ -183,7 +184,8 @@ class Handler(BaseHTTPRequestHandler):
             f"User-Agent: BestHTTP\r\n"
         )
         if cookie:
-            hs += f"Cookie: AWSALBCORS={cookie}\r\n"
+            # cookie = "AWSALB=...; AWSALBCORS=..." (nouveau format) ou simple valeur (ancien format)
+            hs += f"Cookie: {cookie if '=' in cookie else 'AWSALBCORS=' + cookie}\r\n"
         hs += "\r\n"
         f1_sock.sendall(hs.encode())
 
