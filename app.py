@@ -17,6 +17,7 @@ F1_HUB_WSS   = "livetiming.formula1.com"
 
 ALLOWED_ORIGINS = {
     "https://grand-gaz.elementfx.com",
+    "http://gg-test.x10.mx",
     "https://grandgaz.wuaze.com",
     "http://localhost",
     "http://localhost:8000",
